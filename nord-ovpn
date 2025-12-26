@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONF_DIR="/etc/openvpn/ovpn_tcp"
+AUTH_FILE="/etc/openvpn/nord.auth"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+NORD_GEO_PATH="$SCRIPT_DIR/nord-geo"
+
+usage() {
+  cat <<'EOF'
+NordVPN OpenVPN helper (manual configs)
+
+USAGE:
+  nord-ovpn --help
+  nord-ovpn list
+  nord-ovpn list <country_code> [--geo]
+  nord-ovpn list-files <country_code> [--details]
+  nord-ovpn list-files --details <country_code> [--geo]
+  nord-ovpn connect <country_code> [--random]
+  nord-ovpn connect-file <path_to_ovpn>
+
+EXAMPLES:
+  nord-ovpn list
+  nord-ovpn list ch
+  nord-ovpn list ch --geo
+  nord-ovpn list-files ch
+  nord-ovpn list-files ch --details
+  nord-ovpn list-files --details ch
+  nord-ovpn list-files --details ch --geo
+  nord-ovpn connect ch
+  nord-ovpn connect us --random
+  nord-ovpn connect-file /etc/openvpn/ovpn_tcp/ch217.nordvpn.com.tcp.ovpn
+
+NOTES:
+  - Country codes are two-letter ISO codes (ch, us, de, fr, etc.)
+  - Uses OpenVPN TCP configs from:
+      /etc/openvpn/ovpn_tcp
+  - Auth credentials must exist at:
+      /etc/openvpn/nord.auth
+    (two lines: service username, service password)
+  - Must be run with sudo (OpenVPN requirement)
+  - Geo output uses nord-geo and GeoLite2 City to resolve IPs
+
+EOF
+}
+
+require_root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "Please run with sudo."
+    exit 1
+  fi
+}
+
+list_countries() {
+  ls "$CONF_DIR"/*.ovpn 2>/dev/null \
+    | awk -F/ '{print $NF}' \
+    | sed -E 's/^([a-z]{2})[0-9]+.*/\1/' \
+    | sort -u
+}
+
+list_country_files() {
+  local cc="$1"
+  shopt -s nullglob
+  local files=("$CONF_DIR"/"$cc"*.ovpn)
+  if (( ${#files[@]} == 0 )); then
+    return 0
+  fi
+  printf '%s\n' "${files[@]}"
+}
+
+trim_ws() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+resolve_geo_cmd() {
+  if [[ -x "$NORD_GEO_PATH" ]]; then
+    echo "$NORD_GEO_PATH"
+    return 0
+  fi
+  if command -v nord-geo >/dev/null 2>&1; then
+    echo "nord-geo"
+    return 0
+  fi
+  return 1
+}
+
+list_country_files_detailed() {
+  local cc="$1"
+  local geo="${2:-no}"
+  shopt -s nullglob
+  local files=("$CONF_DIR"/"$cc"*.ovpn)
+  if (( ${#files[@]} == 0 )); then
+    return 0
+  fi
+
+  local geo_cmd=""
+  if [[ "$geo" == "yes" ]]; then
+    if ! geo_cmd="$(resolve_geo_cmd)"; then
+      echo "nord-geo not found. Install it or run without --geo." >&2
+      exit 1
+    fi
+  fi
+
+  local f host ip geo_line city region country
+  for f in "${files[@]}"; do
+    host=$(awk -F'CN=' '/^verify-x509-name[[:space:]]+CN=/{print $2; exit}' "$f")
+    ip=$(awk '$1=="remote"{print $2; exit}' "$f")
+    [[ -z "$host" ]] && host="-"
+    [[ -z "$ip" ]] && ip="-"
+    if [[ "$geo" == "yes" && "$ip" != "-" ]]; then
+      geo_line="$("$geo_cmd" "$ip" 2>/dev/null || true)"
+      IFS='|' read -r _ city region country <<< "$geo_line"
+      city="$(trim_ws "${city:-}")"
+      region="$(trim_ws "${region:-}")"
+      country="$(trim_ws "${country:-}")"
+      [[ -z "$city" ]] && city="-"
+      [[ -z "$region" ]] && region="-"
+      [[ -z "$country" ]] && country="-"
+      printf '%s | %s | %s | %s | %s | %s\n' "$(basename "$f")" "$host" "$ip" "$city" "$region" "$country"
+    else
+      printf '%s | %s | %s\n' "$(basename "$f")" "$host" "$ip"
+    fi
+  done
+}
+
+pick_config() {
+  local cc="$1"
+  local random="$2"
+
+  local files
+  mapfile -t files < <(ls "$CONF_DIR"/"$cc"*.ovpn 2>/dev/null)
+
+  if (( ${#files[@]} == 0 )); then
+    echo "No configs found for country: $cc"
+    exit 1
+  fi
+
+  if [[ "$random" == "yes" ]]; then
+    echo "${files[RANDOM % ${#files[@]}]}"
+  else
+    echo "${files[0]}"
+  fi
+}
+
+connect() {
+  local conf="$1"
+
+  require_root
+
+  if [[ ! -f "$AUTH_FILE" ]]; then
+    echo "Missing auth file: $AUTH_FILE"
+    exit 1
+  fi
+
+  echo "Using config: $conf"
+  echo "Using auth:   $AUTH_FILE"
+  echo
+
+  exec openvpn \
+    --config "$conf" \
+    --auth-user-pass "$AUTH_FILE" \
+    --auth-nocache
+}
+
+main() {
+  [[ $# -eq 0 ]] && usage && exit 0
+
+  case "$1" in
+    --help|-h)
+      usage
+      ;;
+    list)
+      if [[ $# -eq 1 ]]; then
+        list_countries
+      else
+        geo="no"
+        cc=""
+        if [[ "${2:-}" == "--geo" ]]; then
+          geo="yes"
+          cc="${3:-}"
+        elif [[ "${3:-}" == "--geo" ]]; then
+          geo="yes"
+          cc="${2:-}"
+        else
+          cc="${2:-}"
+        fi
+        if [[ -z "$cc" ]]; then
+          usage
+          exit 1
+        fi
+        list_country_files_detailed "$cc" "$geo"
+      fi
+      ;;
+    list-files)
+      if [[ $# -lt 2 ]]; then
+        usage
+        exit 1
+      fi
+      detail="no"
+      geo="no"
+      cc=""
+      for arg in "${@:2}"; do
+        case "$arg" in
+          --details) detail="yes" ;;
+          --geo) geo="yes" ;;
+          *) cc="$arg" ;;
+        esac
+      done
+      if [[ -z "$cc" ]]; then
+        usage
+        exit 1
+      fi
+      if [[ "$geo" == "yes" ]]; then
+        detail="yes"
+      fi
+      if [[ "$detail" == "yes" ]]; then
+        list_country_files_detailed "$cc" "$geo"
+      else
+        list_country_files "$cc"
+      fi
+      ;;
+    connect)
+      [[ $# -lt 2 ]] && usage && exit 1
+      cc="$2"
+      random="no"
+      [[ "${3:-}" == "--random" ]] && random="yes"
+      conf="$(pick_config "$cc" "$random")"
+      connect "$conf"
+      ;;
+    connect-file)
+      [[ $# -lt 2 ]] && usage && exit 1
+      connect "$2"
+      ;;
+    *)
+      echo "Unknown command: $1"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
