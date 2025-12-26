@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DB_FILE="/usr/share/GeoIP/GeoLite2-City.mmdb"
+
+usage() {
+  cat <<'USAGE'
+GeoIP lookup helper (GeoLite2 City)
+
+USAGE:
+  nord-geo <ip> [ip ...]
+  nord-geo --db <path> <ip> [ip ...]
+  echo "8.8.8.8" | nord-geo
+
+OUTPUT:
+  One line per IP:
+    IP | City | Region | Country (CC)
+
+NOTES:
+  - Requires mmdblookup and GeoLite2-City.mmdb
+USAGE
+}
+
+trim() {
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+mmdb_get() {
+  local ip="$1"
+  shift
+
+  local out
+  out=$(mmdblookup --file "$DB_FILE" --ip "$ip" "$@" 2>/dev/null \
+    | tr -d '"' \
+    | sed -E 's/[[:space:]]+<[^>]*>$//' \
+    | sed '/^[[:space:]]*$/d' \
+    | tail -n 1 \
+    | trim)
+  if [[ -z "$out" || "$out" == "null" ]]; then
+    echo "-"
+  else
+    echo "$out"
+  fi
+}
+
+main() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+  fi
+
+  if [[ "${1:-}" == "--db" ]]; then
+    DB_FILE="${2:-}"
+    shift 2 || true
+  fi
+
+  if ! command -v mmdblookup >/dev/null 2>&1; then
+    echo "mmdblookup not found in PATH" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$DB_FILE" ]]; then
+    echo "GeoIP DB not found: $DB_FILE" >&2
+    exit 1
+  fi
+
+  local ips=()
+  if (( $# > 0 )); then
+    ips=("$@")
+  else
+    mapfile -t ips < <(tr -s '[:space:]' '\n' < /dev/stdin | sed '/^$/d')
+  fi
+
+  if (( ${#ips[@]} == 0 )); then
+    usage
+    exit 1
+  fi
+
+  local ip city region country cc
+  for ip in "${ips[@]}"; do
+    city=$(mmdb_get "$ip" city names en)
+    region=$(mmdb_get "$ip" subdivisions 0 names en)
+    country=$(mmdb_get "$ip" country names en)
+    cc=$(mmdb_get "$ip" country iso_code)
+    printf '%s | %s | %s | %s (%s)\n' "$ip" "$city" "$region" "$country" "$cc"
+  done
+}
+
+main "$@"
